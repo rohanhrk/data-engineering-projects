@@ -18,6 +18,7 @@ import pg8000.dbapi
 
 from productpulse.config import get_env, lakebase_connection_info
 
+
 def lakebase_password() -> str:
     """Return the password/token used for a Lakebase connection.
 
@@ -39,6 +40,7 @@ def lakebase_password() -> str:
     static_password = get_env("PGPASSWORD")
     if static_password:
         return static_password
+    
     endpoint = get_env("LAKEBASE_ENDPOINT")
     if not endpoint:
         raise RuntimeError(
@@ -58,6 +60,7 @@ def lakebase_password() -> str:
     credential = WorkspaceClient().postgres.generate_database_credential(endpoint=endpoint)
     return credential.token
 
+
 def ssl_context_from_mode(sslmode: str) -> bool | ssl.SSLContext | None:
     """Translate familiar Postgres sslmode values into pg8000 settings.
 
@@ -74,6 +77,7 @@ def ssl_context_from_mode(sslmode: str) -> bool | ssl.SSLContext | None:
         return ssl.create_default_context()
     return True
     
+
 @contextmanager
 def connect() -> Iterator[Any]:
     """Open one Lakebase connection and manage the transaction lifecycle.
@@ -104,7 +108,8 @@ def connect() -> Iterator[Any]:
         raise
     finally:
         conn.close()
-    
+
+
 def init_lakebase_schema(conn: Any, embedding_dimentions: int = 1024) -> None:
     """Create the Lakebase tables required by retrieval and memory.
 
@@ -174,6 +179,7 @@ def init_lakebase_schema(conn: Any, embedding_dimentions: int = 1024) -> None:
     finally:
         cur.close()
 
+
 def vector_literal(values: list[float]) -> str:
     """Format a Python list as a pgvector-compatible literal.
 
@@ -183,6 +189,8 @@ def vector_literal(values: list[float]) -> str:
     """
     
     return "[" + ",".join(str(float(value)) for value in values) + "]"
+
+
 def upsert_chunks(conn: str, chunks: list[dict[str, object]], embeddings:list[list[float]]) -> int:
     """Insert or update chunk embeddings in Lakebase.
 
@@ -238,3 +246,131 @@ def upsert_chunks(conn: str, chunks: list[dict[str, object]], embeddings:list[li
     finally:
         cur.close()
     return len(rows)
+
+
+def rows_as_dicts(cursor: Any) -> list[dict[str, object]]:
+    """Convert DB-API result rows into dictionaries.
+
+    pg8000 follows the DB-API default and returns tuples. This helper keeps the
+    rest of the application readable: retrieval and memory code can work with
+    dictionaries even though the database driver returns positional rows.
+    """
+    column_names = [column[0] for column in cursor.description]
+    rows = []
+    for row in cursor.fetchall():
+        row_dict = dict(zip(column_names, row))
+        for json_column in ["metadata_json"]:
+            if isinstance(row_dict.get(json_column), str):
+                row_dict[json_column] = json.loads(row_dict[json_column])
+        rows.append(row_dict)
+    return rows
+
+     
+def search_chunks(
+    conn: Any,
+    query_embedding: list[float],
+    top_k: int = 8,
+    product_id: str | None = None
+) -> list[dict[str, object]]:
+    """Retrieve nearest chunks from Lakebase using pgvector-compatible syntax.
+
+    Input:
+    - `query_embedding`: vector for the rewritten user question.
+    - `top_k`: number of candidate chunks to return before reranking.
+    - `product_id`: optional metadata filter for product-specific questions.
+
+    Output:
+    - Rows with chunk text, metadata, and vector distance. Lower distance means
+      the chunk is semantically closer to the query.
+    """
+
+    query_vector = vector_literal(query_embedding)
+    params: list[object] = [query_vector]
+    filter_sql = ""
+    if product_id:
+        filter_sql = "WHERE product_id = %s"
+        params.append(product_id)
+    params.extend([query_vector, top_k])
+
+    cur = conn.cursor()
+    try:
+        # `<->` is the vector distance operator. It is used both in SELECT so we
+        # can display the distance later, and in ORDER BY so Lakebase returns the
+        # nearest chunks first.
+        cur.execute(
+            f"""
+                SELECT
+                    chunk_id,
+                    source_id,
+                    source_type,
+                    product_id,
+                    event_date,
+                    title,
+                    chunk_text,
+                    metadata_json,
+                    embedding <-> %s::vector AS distance
+                FROM rag_chunks
+                {filter_sql}
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s;
+            """,
+            params
+        )
+        return rows_as_dicts(cur)
+    finally:
+        cur.close()
+
+
+def read_memory(conn: Any, session_id: str, limit: int = 5) -> list[dict[str, object]]:
+    """Read recent memory facts for the current conversation.
+
+    Memory is scoped by session_id so one user's preferences do not leak into
+    another user's conversation.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+                SELECT
+                    memory_type,
+                    memory_text,
+                    metadata_json,
+                    created_at
+                FROM conversation_memory
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """,
+            (session_id, limit)
+        )
+        return rows_as_dicts(cur)
+    finally:
+        cur.close()
+
+
+def write_memory(
+    conn: Any,
+    session_id: str,
+    memory_type: str,
+    memory_text: str,
+    metadata: dict[str, object] | None = None
+) -> None:
+    """Persist one compact memory item for future turns.
+
+    The project stores two simple memory types in the same table:
+    - `conversation_turn`: a compact summary of a normal user/assistant turn.
+    - `user_preference`: a durable instruction or preference the user gave.
+
+    It should not be used for raw sensitive support transcripts.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+                INSERT INTO conversation_memory (session_id, memory_type, memory_text, metadata_json)
+                VALUES (%s, %s, %s, %s::jsonb);
+            """,
+            (session_id, memory_type, memory_text, json.dumps(metadata or {}))
+        )
+    finally:
+        cur.close()

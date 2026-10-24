@@ -47,6 +47,7 @@ def extract_chat_text(response: Any) -> str:
     choices = payload.get("choices") or []
     if not choices:
         return str(payload)
+    
     first_choice = choices[0]
     if not isinstance(first_choice, dict):
         first_choice = first_choice.as_dict() if hasattr(first_choice, "as_dict") else {}
@@ -89,11 +90,11 @@ def chat_completion(
     # repeatable support guidance, not creative writing.
     workspace = WorkspaceClient()
     try:
-        response = workspace.serving_endpoint.query(
+        response = workspace.serving_endpoints.query(
             name = settings.llm_endpoint,
             messages = [
                 ChatMessage(role=ChatMessageRole.SYSTEM, content=system_prompt),
-                ChatMessage(Role=ChatMessageRole.USER, content=user_prompt)
+                ChatMessage(role=ChatMessageRole.USER, content=user_prompt)
             ],
             temperature=temperature,
             max_tokens=max_tokens
@@ -107,3 +108,147 @@ def chat_completion(
             f"{type(exc).__name__}: {exc}"
         ) from exc
     return extract_chat_text(response)
+
+
+def embedding_model_candidates(primary_model: str) -> list[str]:
+    """Return embedding endpoint names to try, in order.
+
+    Databricks exposes some foundation models through slightly different names
+    in different UI/API surfaces. The user's workspace test confirmed the
+    endpoint-style Qwen name works, so it is tried first. The `system.ai` name
+    remains as a last alias in case another workspace exposes that path.
+    """
+    candidates = [primary_model]
+    fallback_models = [
+        "databricks-qwen3-embedding-0-6b",
+        "system.ai.qwen3-embedding-0-6b",
+    ]
+    for model in fallback_models:
+        if model not in candidates:
+            candidates.append(model)
+    return candidates
+
+
+def extract_embedding_vectors(response: Any) -> list[list[float]]:
+    """Pull embedding vectors out of a serving endpoint response.
+
+    Foundation Model embedding responses normally look like OpenAI responses:
+    `{"data": [{"embedding": [...]}]}`. This helper also accepts a few common
+    SDK shapes so the code remains robust across Databricks runtime versions.
+    """
+    payload = response_as_dict(response)
+    data = payload.get("data") or payload.get("predictions") or []
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("predictions") or []
+
+    vectors: list[list[float]] = []
+    for item in data:
+        if isinstance(item, dict):
+            vector = item.get("embedding")
+        else:
+            vector = getattr(item, "embedding", None)
+        
+        if vector is not None:
+            vectors.append([float(value) for value in vector])
+    return vectors
+
+
+def embed_texts(texts: Iterable[str], batch_size: int = 32) -> list[list[float]]:
+    """Create semantic vectors for a list of text chunks.
+
+    Where this is used:
+    - Notebook `03_embed_and_sync_lakebase.py` embeds every silver RAG chunk.
+    - `retrieval.py` embeds the rewritten user query during chat.
+
+    Input:
+    - `texts`: any iterable of strings. The function converts it to a list
+      because the Databricks API expects a batch-like payload.
+
+    Output:
+    - A list of embedding vectors in the same order as the input texts. This
+      positional alignment is important because the ingestion notebook zips
+      chunk rows and vectors together before writing to Lakebase.
+
+    Why batching exists:
+    - The dataset is small enough for a class project, but PDF chunking can
+      still create hundreds of inputs.
+    - Sending all chunks in one model request can create large payloads and make
+      serverless notebook sessions less stable.
+    - Small batches are easier to retry and friendlier to endpoint limits.
+    """
+    text_list = list(texts)
+    if not text_list:
+        return []
+    
+    # Read the configured endpoint name at runtime. This keeps the source code
+    # portable across Free Edition workspaces and paid workspaces.
+    settings = load_settings()
+    try:
+        from databricks.sdk import WorkspaceClient
+    except ImportError as exc:
+         raise RuntimeError(
+            "databricks-sdk is required for real embeddings. "
+            "Install requirements.txt before running the notebook or app."
+        ) from exc
+
+    # WorkspaceClient uses the identity available in the current Databricks
+    # context. In a workflow job this is the job run identity; locally it uses
+    # DATABRICKS_HOST and DATABRICKS_TOKEN if they are set.
+    workspace = WorkspaceClient()
+    embeddings: list[list[float]] = []
+    models_to_try = embedding_model_candidates(settings.embedding_model)
+    total_batches = (len(text_list) + batch_size - 1) // batch_size
+    print(
+        f"Embedding {len(text_list)} text chunks in {total_batches} batches "
+        f"using candidates={models_to_try}",
+        flush=True,
+    )
+    for start in range(0, len(text_list), batch_size):
+        batch = text_list[start:start + batch_size]
+        batch_number = (start // batch_size) + 1
+        last_error: Exception | None = None
+        response = None
+        for model_name in models_to_try:
+            try:
+                started_at = time.monotonic()
+                print(
+                    f"Embedding batch {batch_number}/{total_batches} "
+                    f"with model={model_name}, rows={len(batch)}",
+                    flush=True,
+                )
+                response = workspace.serving_endpoints.query(
+                    name = model_name,
+                    input = batch
+                )
+                batch_embeddings = extract_embedding_vectors(response)
+                if len(batch_embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"Endpoint '{model_name}' returned {len(batch_embeddings)} "
+                        f"embeddings for {len(batch)} input texts."
+                    )
+                embeddings.extend(batch_embeddings)
+                elapsed = time.monotonic() - started_at
+                print(
+                    f"Finished batch {batch_number}/{total_batches} "
+                    f"with {len(batch_embeddings)} embeddings in {elapsed:.1f}s",
+                    flush=True,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"Embedding batch {batch_number}/{total_batches} failed "
+                    f"with model={model_name}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        if response is None:
+            raise RuntimeError(
+                "Embedding endpoint call failed. Tried these endpoint names: "
+                f"{models_to_try}. In Databricks, open system.ai or Serving and "
+                "confirm which embedding model exists in your workspace. If it "
+                "has a different name, pass the correct `embedding_model` job "
+                "parameter or set PRODUCTPULSE_EMBEDDING_MODEL. Last Databricks "
+                f"error: {type(last_error).__name__}: {last_error}"
+            ) from last_error
+    return embeddings
+            

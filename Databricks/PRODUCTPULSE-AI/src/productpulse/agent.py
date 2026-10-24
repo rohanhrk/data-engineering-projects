@@ -15,10 +15,11 @@ mirrors a production pattern:
 """
 from __future__ import annotations
 
+import uuid
 import json
 import re
 from typing import Any
-
+from contextlib import contextmanager
 from databricks import sql
 
 from productpulse.config import get_env, load_settings
@@ -33,6 +34,7 @@ FINAL_ANSWER_SYSTEM_PROMPT = """
     what is missing. Include concise citations like [1], [2]. End with practical
     next actions for product, support, or operations teams.
 """
+
 
 PLANNER_SYSTEM_PROMPT = """
     You are the tool planner for ProductPulse AI.
@@ -71,6 +73,7 @@ PLANNER_SYSTEM_PROMPT = """
     }
 """
 
+
 MEMORY_WRITE_PATTERNS = [
     r"^\s*remember\s+(that\s+)?",
     r"^\s*please\s+remember\s+(that\s+)?",
@@ -83,6 +86,7 @@ MEMORY_WRITE_PATTERNS = [
     r"\bi prefer\b",
     r"\bi care most about\b",
 ]
+
 
 SQL_ONLY_PATTERNS = [
     r"^\s*sql\s+only\s*:?",
@@ -97,6 +101,7 @@ SQL_ONLY_PATTERNS = [
     r"\bdo\s+not\s+use\s+lakebase\b",
     r"\bwithout\s+lakebase\b",
 ]
+
 
 METRIC_TERMS = [
     "highest",
@@ -119,6 +124,7 @@ METRIC_TERMS = [
     "negative sentiment",
 ]
 
+
 RAG_EXPLANATION_TERMS = [
     "why",
     "reason",
@@ -138,6 +144,7 @@ RAG_EXPLANATION_TERMS = [
     "complaints about",
 ]
 
+
 TOOL_PLAN_KEYS = [
     "read_memory",
     "rag_search",
@@ -145,6 +152,38 @@ TOOL_PLAN_KEYS = [
     "write_memory",
     "write_durable_memory",
 ]
+
+
+def should_use_sql_only(question: str) -> bool:
+    """Return True when a turn should use only structured metrics.
+
+    Normal agent questions combine memory, RAG evidence, and optional metrics.
+    For classroom demos it is useful to prove the SQL tool separately. Explicit
+    phrases such as `SQL only:` always force that path. Pure aggregate questions
+    such as "top products by ticket count" also use SQL-only automatically.
+    """
+    lowered = question.lower()
+    if any(re.search(pattern, lowered) for pattern in SQL_ONLY_PATTERNS):
+        return True
+
+    has_matric_intent = any(term in lowered for term in METRIC_TERMS)
+    needs_unstructured_evidence = any(term in lowered for term in RAG_EXPLANATION_TERMS)
+    return has_matric_intent and not needs_unstructured_evidence
+
+
+def should_write_memory(question: str) -> bool:
+    """Return True when the user is explicitly asking for durable memory.
+
+    This function is not the only memory write path. Normal turns are also
+    saved as compact `conversation_turn` memory rows after the answer is
+    generated. This function only detects stronger long-term preferences and
+    instructions, such as "remember that I care about sizing issues" or
+    "from now on, answer for support team leads".
+    """
+    lowered = question.lower()
+    if any(re.search(pattern, lowered) for pattern in MEMORY_WRITE_PATTERNS):
+        return True
+    
 
 def asks_memory_recall(question: str) -> bool:
     """Return True when the user asks to inspect remembered context.
@@ -164,33 +203,6 @@ def asks_memory_recall(question: str) -> bool:
             "saved preferences",
         ]
     )
-
-
-def should_write_memory(question: str) -> bool:
-    """Return True when the user is explicitly asking for durable memory.
-
-    This function is not the only memory write path. Normal turns are also
-    saved as compact `conversation_turn` memory rows after the answer is
-    generated. This function only detects stronger long-term preferences and
-    instructions, such as "remember that I care about sizing issues" or
-    "from now on, answer for support team leads".
-    """
-    lowered = question.lower()
-    if any(re.search(pattern, lowered) for pattern in MEMORY_WRITE_PATTERNS):
-        return True
-    
-
-def should_use_sql_only(question: str) -> bool:
-    """Return True when a turn should use only structured metrics.
-
-    Normal agent questions combine memory, RAG evidence, and optional metrics.
-    For classroom demos it is useful to prove the SQL tool separately. Explicit
-    phrases such as `SQL only:` always force that path. Pure aggregate questions
-    such as "top products by ticket count" also use SQL-only automatically.
-    """
-    lowered = question.lower()
-    if any(re.search(pattern, lowered) for pattern in SQL_ONLY_PATTERNS):
-        return True
 
 
 def deterministic_plan_tools(question: str) -> dict[str, Any]:
@@ -254,6 +266,25 @@ def deterministic_plan_tools(question: str) -> dict[str, Any]:
         "planner_source": "deterministic_fallback"
     }
 
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    """Parse the first JSON object from an LLM planner response.
+
+    The planner prompt asks for JSON only, but some models may still wrap the
+    response in explanatory text. This helper accepts either strict JSON or a
+    response containing one JSON object.
+    """
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.find("}")
+
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(stripped[start : end + 1])
+  
 
 def bool_value(value: Any) -> bool:
     """Normalize planner booleans from JSON-like values."""
@@ -369,27 +400,8 @@ def normalize_tool_plan(raw_plan: dict[str, Any], question: str) -> dict[str, An
         )
 
     return plan
+  
 
-
-def extract_json_object(text: str) -> dict[str, Any]:
-    """Parse the first JSON object from an LLM planner response.
-
-    The planner prompt asks for JSON only, but some models may still wrap the
-    response in explanatory text. This helper accepts either strict JSON or a
-    response containing one JSON object.
-    """
-    stripped = text.strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.find("}")
-
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return json.loads(stripped[start : end + 1])
-    
-    
 def plan_tools(question: str) -> dict[str, Any]:
     """Ask the LLM planner which tools should run for this turn.
 
@@ -411,7 +423,7 @@ def plan_tools(question: str) -> dict[str, Any]:
         User question:
         {question}
 
-        Return the tool plan json now
+        Return the tool plan json now.
     """
 
     try:
@@ -429,6 +441,57 @@ def plan_tools(question: str) -> dict[str, Any]:
         plan["planner_error"] = f"{type(exc).__name__}: {exc}"[:500]
         return plan
     
+
+def execution_mode_from_plan(tool_plan: dict[str, Any]) -> str:
+    """Name the execution mode for the app trace.
+
+    This is mainly for teaching and troubleshooting. When learners ask a
+    SQL-only question, the trace should plainly say `sql_only_metrics`, and
+    retrieved evidence should be an empty list.
+    """
+    if tool_plan.get("route") == "sql_only":
+        return "sql_only_matrics"
+    if tool_plan.get("route") == "hybrid":
+        return "hybrid_rag_sql_agent"
+    if tool_plan.get("route") == "memory_only":
+        return "memory_only_agent"
+    return "memory_rag_agent"
+
+@contextmanager
+def recoverable_db_operation(conn):
+    """Allow a failed DB operation to roll back independently."""
+    savepoint = f"sp_{uuid.uuid4().hex}"
+
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {savepoint}")
+
+    try:
+        yield
+    except Exception:
+        with conn.cursor() as cur:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+    else:
+        with conn.cursor() as cur:
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    
+def extract_product_id(question: str) -> str | None:
+    """Find a product id inside the user question.
+
+    The synthetic product ids use a clear retail SKU-like format, for example:
+    - RUN-ULTRA-01
+    - SOC-CLEAT-04
+
+    If a product id is found, the RAG tool can filter Lakebase retrieval to that
+    product. If no product id is found, retrieval searches across all products.
+    """
+
+    PRODUCT_PATTERN = r"\b[A-Z]{2,6}-[A-Z0-9-]{2,}\b"
+    match = re.search(PRODUCT_PATTERN, question.upper())
+    return match.group(0) if match else None
+
 
 def memory_text_from_question(question: str) -> str:
     """Convert a memory command into a compact memory fact.
@@ -448,36 +511,138 @@ def memory_text_from_question(question: str) -> str:
     return cleaned[:500]
 
 
-def extract_product_id(question: str) -> str | None:
-    """Find a product id inside the user question.
+def query_product_metrics(question: str, product_id: str | None = None) -> list[dict[str, Any]]:
+    """Query curated gold tables through a Databricks SQL warehouse.
 
-    The synthetic product ids use a clear retail SKU-like format, for example:
-    - RUN-ULTRA-01
-    - SOC-CLEAT-04
+    The query is intentionally constrained. The LLM never writes arbitrary SQL;
+    the agent picks one known-safe template and passes only product/date filters.
+    """
+    # The SQL Warehouse HTTP path is required because the Streamlit app and
+    # notebooks query Delta tables through the Databricks SQL connector.
+    http_path = get_env("DATABRICKS_SQL_HTTP_PATH")
+    if not http_path:
+        return [{"warning": "DATABRICKS_SQL_HTTP_PATH is not configured, metrics skipped."}]
+    
+    settings = load_settings()
 
-    If a product id is found, the RAG tool can filter Lakebase retrieval to that
-    product. If no product id is found, retrieval searches across all products.
+    # Local execution can use DATABRICKS_HOST and DATABRICKS_TOKEN from `.env`.
+    # Databricks Apps should use the Databricks SDK credential provider injected
+    # into the app runtime, so a personal access token is not required there.
+    host = (get_env("DATABRICKS_HOST") or "").replace("https://", "")
+    access_token = get_env("DATABRICKS_TOKEN")
+    credentials_provider = None
+    try:
+        from databricks.sdk.core import Config
+
+        cfg = Config()
+        if not host:
+            host = cfg.host.replace("https://", "")
+        if not access_token:
+            # Databricks SQL Connector expects a callable. In Databricks Apps,
+            # Config().authenticate resolves to OAuth headers for the app
+            # service principal, so wrap it in a lambda instead of passing the
+            # dictionary directly.
+            credentials_provider = lambda: cfg.authenticate
+    except Exception:
+        if not host:
+            return [{"warning": "DATABRICKS_HOST is not configured, metrics skipped."}]
+        
+    table = settings.gold_product_daily_table
+
+    lowered = question.lower()
+    if "ticket" in lowered:
+        order_column = "total_ticket_count"
+    elif "return rate" in lowered or ("return" in lowered and "rate" in lowered):
+        order_column = "computed_return_rate"
+    elif "return" in lowered:
+        order_column = "total_return_count"
+    elif "rating" in lowered:
+        order_column = "avg_rating"
+    elif "sold" in lowered or "sales" in lowered or "units" in lowered:
+        order_column = "total_units_sold"
+    elif "review" in lowered:
+        order_column = "total_review_count"
+    else:
+        order_column = "total_negative_sentiment_count"
+
+    # The LLM never gets to generate SQL. This is a core production practice:
+    # the agent selects a safe, predefined query template and only supplies a
+    # product_id parameter when available.
+    where = "WHERE product_id = %(product_id)s" if product_id else ""
+    params = {"product_id": product_id} if product_id else {}
+    query = f"""
+        /* ProductPulse metric tool: governed aggregate over gold_product_daily. */
+        SELECT
+            product_id,
+            product_name,
+            category,
+            MIN(event_date) AS first_event_date,
+            MAX(event_date) AS latest_event_date,
+            SUM(review_count) AS total_review_count,
+            SUM(ticket_count) AS total_ticket_count,
+            SUM(order_count) AS total_order_count,
+            SUM(units_sold) AS total_units_sold,
+            SUM(return_count) AS total_return_count,
+            ROUND(SUM(return_count) / NULLIF(SUM(order_count), 0), 4) AS computed_return_rate,
+            ROUND(AVG(return_rate), 4) AS avg_daily_return_rate,
+            ROUND(AVG(avg_rating), 2) AS avg_rating,
+            SUM(negative_sentiment_count) AS total_negative_sentiment_count,
+            SUM(return_related_count) AS total_return_related_count,
+            MIN(on_hand_units) AS min_on_hand_units,
+            MAX(stock_status) AS latest_stock_status,
+            ARRAY_JOIN(ARRAY_SORT(ARRAY_DISTINCT(COLLECT_LIST(top_issue))), ', ') AS observed_top_issues
+        FROM {table}
+        {where}
+        GROUP BY product_id, product_name, category
+        ORDER BY {order_column} DESC, product_id
+        LIMIT 20
     """
 
-    PRODUCT_PATTERN = r"\b[A-Z]{2,6}-[A-Z0-9-]{2,}\b"
-    match = re.search(PRODUCT_PATTERN, question.upper())
-    return match.group(0) if match else None
+    connection_args = {"server_hostname": host, "http_path": http_path}
+    if access_token:
+        connection_args["access_token"] = access_token
+    elif credentials_provider:
+        connection_args["credentials_provider"] = credentials_provider
+    else:
+        return [{"warning": "Databricks SQL credentials are not configured, metrics skipped."}]
+    
+    try:
+        with sql.connect(**connection_args) as conn:
+            with conn.cursor() as cur:
+                # The connector handles parameter substitution for `product_id`.
+                # This keeps the query safe and repeatable.
+                cur.execute(query, params)
+                columns = [description[0] for description in cur.description]
+                rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+                return rows
+    except Exception as exc:
+        return [
+            {
+                "warning": (
+                    "Metric SQL query was skipped. Confirm the Databricks App "
+                    "service principal has CAN USE on the SQL warehouse, USE "
+                    f"CATALOG on {settings.catalog}, USE SCHEMA on "
+                    f"{settings.catalog}.gold, and SELECT on the "
+                    f"gold tables. Original error: {exc}"
+                )
+            }
+        ]
 
 
-def execution_mode_from_plan(tool_plan: dict[str, Any]) -> str:
-    """Name the execution mode for the app trace.
+def turn_summary_for_memory(question: str, answer: str) -> str:
+    """Create a compact memory row for the completed chat turn.
 
-    This is mainly for teaching and troubleshooting. When learners ask a
-    SQL-only question, the trace should plainly say `sql_only_metrics`, and
-    retrieved evidence should be an empty list.
+    We intentionally do not store the full assistant answer here. A concise
+    summary keeps the `conversation_memory` table readable for learners and
+    prevents the next prompt from being filled with long historical answers.
     """
-    if tool_plan.get("route") == "sql_only":
-        return "sql_only_matrics"
-    if tool_plan.get("route") == "hybrid":
-        return "hybrid_rag_sql_agent"
-    if tool_plan.get("route") == "memory_only":
-        return "memory_only_agent"
-    return "memory_rag_agent"
+    compact_question = " ".join(question.strip().split())
+    compact_answer = " ".join(answer.strip().split())
+
+    return (
+        f"User asked: {compact_question[:240]} | "
+        f"Assistant answered: {compact_answer[:420]}"
+    )
 
 
 def answer_question(
@@ -522,12 +687,17 @@ def answer_question(
             "This question needs Lakebase for memory or RAG retrieval, but no "
             "Lakebase connection was provided."
         )
-    
+
     # Step 3: pull recent conversation memory. Memory is not used as ground
     # truth; it only provides conversational context like user preferences.
     memory_warnings = []
     try:
-        memories = read_memory(conn, session_id=session_id) if tool_plan["read_memory"] else []
+        with recoverable_db_operation(conn):
+            memories = (
+                read_memory(conn, session_id=session_id) 
+                if tool_plan["read_memory"] 
+                else []
+            )
     except Exception as exc:
         memories = []
         memory_warnings.append(
@@ -546,8 +716,8 @@ def answer_question(
                 conn,
                 session_id=session_id,
                 memory_type="user_preference",
-                memory_text = memory_text_to_save,
-                metadata={"source": "agent_turn", "raw_question": question[:500]}
+                memory_text=memory_text_to_save,
+                metadata={"source": "agent_turn", "raw_question": question[:500]},
             )
             memory_write_results.append("saved:user_preference")
             memories.insert(
@@ -555,8 +725,8 @@ def answer_question(
                 {
                     "memory_type": "user_preference",
                     "memory_text": memory_text_to_save,
-                    "metadata": {"source": "current_turn"}
-                }
+                    "metadata": {"source": "current_turn"},
+                },
             )
         except Exception as exc:
             memory_write_results.append("failed:user_preference")
@@ -571,5 +741,81 @@ def answer_question(
         retrieval = retrieve_context(
             conn,
             question=question,
-            product_id=product_id
+            product_id=product_id,
         )
+    else:
+        retrieval = {
+            "rewritten_query": "RAG skipped because this was a SQL-only turn.",
+            "evidence": [],
+            "context": "",
+        }
+
+    # Step 5: optionally query structured metrics from the gold Delta table.
+    # This gives the final answer operational numbers in addition to text
+    # evidence.
+    metrics = query_product_metrics(question, product_id) if tool_plan["query_metrics"] else []
+
+    # Step 6: format memory and metrics into compact text for the final prompt.
+    # The evidence context is already formatted in retrieval.py.
+    memory_text = "\n".join(f"- {row['memory_type']}: {row['memory_text']}" for row in memories)
+    metrics_text = "\n".join(str(row) for row in metrics)
+    user_prompt = f"""
+        User question:
+        {question}
+
+        Recent memory:
+        {memory_text or "No prior memory for this session."}
+
+        Structured metrics:
+        {metrics_text or "No metric tool was needed for this question."}
+
+        Retrieved evidence:
+        {retrieval["context"] or "No evidence was retrieved."}
+    """
+
+    answer = chat_completion(
+        FINAL_ANSWER_SYSTEM_PROMPT,
+        user_prompt,
+        temperature=0.1,
+        max_tokens=900,
+    )
+
+    # Step 7: save a compact record of the full turn. This is the realistic
+    # "the agent remembers the conversation" behavior: every normal RAG/agent
+    # turn leaves a small memory row, while SQL-only demo turns intentionally do
+    # not touch Lakebase.
+    if tool_plan["write_memory"]:
+        try:
+            write_memory(
+                conn,
+                session_id=session_id,
+                memory_type="conversation_turn",
+                memory_text=turn_summary_for_memory(question, answer),
+                metadata={
+                    "source": "agent_turn",
+                    "product_id": product_id,
+                    "query_metrics": tool_plan["query_metrics"],
+                    "rag_search": tool_plan["rag_search"],
+                },
+            )
+            memory_write_results.append("saved:conversation_turn")
+        except Exception as exc:
+            memory_write_results.append("failed:conversation_turn")
+            memory_warnings.append(
+                "Turn memory write was skipped because the app identity cannot "
+                f"write conversation_memory: {exc}"
+            )
+
+    return {
+        "answer": answer,
+        "execution_mode": execution_mode,
+        "lakebase_used": needs_lakebase,
+        "tool_plan": tool_plan,
+        "product_id": product_id,
+        "rewritten_query": retrieval["rewritten_query"],
+        "evidence": retrieval["evidence"],
+        "metrics": metrics,
+        "memory_write_result": memory_write_results or ["not_requested"],
+        "memory_seen": memories,
+        "memory_warnings": memory_warnings,
+    }

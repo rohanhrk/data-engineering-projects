@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+
 def get_env(name: str, default: str | None = None) -> str | None:
     """Read one environment variable.
 
@@ -29,6 +30,7 @@ def get_env(name: str, default: str | None = None) -> str | None:
         return default
     return value
 
+
 def require_env(name: str) -> str:
     """Read a required environment variable and raise a clear error if absent.
 
@@ -42,6 +44,7 @@ def require_env(name: str) -> str:
             "See .env.example and TECHNICAL_RUNBOOK.md."
         )
     return value
+
 
 def lakebase_connection_info() -> dict[str, str]:
     """Return Lakebase/Postgres connection parameters.
@@ -62,6 +65,7 @@ def lakebase_connection_info() -> dict[str, str]:
         "sslmode": get_env("PGSSLMODE", "require"),
     }
 
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings shared by retrieval, the agent, and the app.
@@ -80,7 +84,7 @@ class Settings:
     def silver_chunks_table(self) -> str:
         """Fully-qualified Delta table containing chunk text and metadata."""
 
-        return f"{self.catalog}.schema.document_chunks"
+        return f"{self.catalog}.silver.document_chunks"
 
     @property
     def gold_product_daily_table(self) -> str:
@@ -93,6 +97,7 @@ class Settings:
         """Fully-qualified Delta table for issue-level daily metrics."""
 
         return f"{self.catalog}.gold.issue_daily"
+
 
 def load_settings() -> Settings:
     """Build runtime settings from environment variables.

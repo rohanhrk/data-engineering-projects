@@ -15,12 +15,6 @@ import streamlit as st
 from dotenv import load_dotenv
 
 
-st.set_page_config(
-    page_title="ProductPulse AI",
-    page_icon="PP",
-    layout="wide",
-)
-
 def find_project_root() -> Path:
     """Find the deployed project root in local and Databricks App runtimes.
 
@@ -31,7 +25,7 @@ def find_project_root() -> Path:
     `<project>/src/productpulse`. Therefore the Databricks App must be deployed
     from the bundle/project root, not from the `app/` folder alone.
     """
-    current = Path(__file__).resolve
+    current = Path(__file__).resolve()
     for candidate in [current.parent, *current.parents]:
         if (candidate / "src" / "productpulse").exists():
             return candidate
@@ -66,6 +60,13 @@ except ModuleNotFoundError as exc:
     st.write("src/productpulse exists", (PROJECT_ROOT / "src" / "productpulse").exists())
     st.write("Python path", sys.path)
     raise exc
+
+
+st.set_page_config(
+    page_title="ProductPulse AI",
+    page_icon="PP",
+    layout="wide",
+)
 
 
 def inject_styles() -> None:
@@ -525,190 +526,75 @@ def inject_styles() -> None:
     )
 
 
-def render_trace(result: dict[str, object]) -> None:
-    """Show the agent trace in compact tabs.
+@st.cache_resource(show_spinner=False)
+def ensure_lakebase_ready() -> bool:
+    """Verify Lakebase connectivity without requiring schema DDL permissions.
 
-    This trace is intentionally visible in the demo app. It lets learners
-    verify whether a question used SQL-only routing, RAG retrieval, memory, or
-    a hybrid path without reading logs.
+    The daily pipeline owns schema creation and data loading. The app should be
+    least-privilege: it needs to read `rag_chunks` and read/write
+    `conversation_memory`, but it does not need permission to create extensions
+    or tables in the `public` schema.
     """
-    with st.expander("Agent trace", expanded=False):
-        overview, metrics_tab, memory_tab, evidence_tab = st.tabs(
-            ["Route", 'Metrics', "Memory", "Evidence"]
-        )
 
-        with overview:
-            st.write("Execution mode", result.get("execution_mode"))
-            st.write("Lakebase used", result.get("lakebase_used"))
-            st.write("Tool plan", result["tool_plan"])
-            st.write("Rewritten query", result["rewritten_query"])
-        with metrics_tab:
-            st.write(result["metrics"])
-        with memory_tab:
-            st.write("Memory write result", result.get("memory_write_result"))
-            st.write("Memory seen", result.get("memory_seen"))
-            if result.get("memory_warnings"):
-                st.write("Memory warnings", result["memory_warnings"])
-        with evidence_tab:
-            st.write(result["evidence"])
+    with connect() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        finally:
+            cur.close()
+    return True
 
 
-def render_empty_state() -> None:
-    """Render a clean first-run state above the chat input."""
+def missing_config() -> list[str]:
+    """List configuration values required before the app can answer questions.
 
-    st.markdown(
-        """
-        <div class="pp-empty-state">
-          <div class="pp-empty-title">Conversation is ready.</div>
-          <div>Start with a RAG investigation, a SQL metric ranking, or a memory check from the prompt cards.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_prompt_form() -> str | None:
-    """Render the primary prompt form and return submitted text."""
-    st.markdown(
-        """
-        <div class="pp-section-head">
-          <div>
-            <div class="pp-section-title">Ask ProductPulse</div>
-            <div class="pp-section-subtitle">Questions are routed to RAG, SQL metrics, memory, or a combined agent turn.</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    with st.form("ask-productpulse", clear_on_submit=True):
-        prompt = st.text_input(
-            "Question",
-            label_visibility="collapsed",
-            placeholder="Ask about returns, product issues, ticket counts, sentiment, support guidance, or memory..."
-        )
-        submitted = st.form_submit_button("Run analysis", use_container_width=True)
-    return prompt.strip() if submitted and prompt.strip() else None
-
-    
-def render_dataset_strip() -> None:
-    """Render compact dataset signals for the empty/start state."""
-
-    st.markdown(
-        """
-        <div class="pp-mini-grid">
-          <div class="pp-mini">
-            <div class="pp-mini-num">2,331</div>
-            <div class="pp-mini-label">customer reviews</div>
-          </div>
-          <div class="pp-mini">
-            <div class="pp-mini-num">720</div>
-            <div class="pp-mini-label">support tickets</div>
-          </div>
-          <div class="pp-mini">
-            <div class="pp-mini-num">925</div>
-            <div class="pp-mini-label">return events</div>
-          </div>
-          <div class="pp-mini">
-            <div class="pp-mini-num">100</div>
-            <div class="pp-mini-label">PDF pages indexed</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    Lakebase values are needed for both vector retrieval and memory. The SQL
+    Warehouse HTTP path is needed only for metric questions, but showing it here
+    makes setup issues visible immediately in the UI.
+    """
+    required = ["PGHOST", "PGDATABASE", "PGUSER"]
+    missing = [name for name in required if not get_env(name)]
+    if not get_env("PGPASSWORD") and not get_env("LAKEBASE_ENDPOINT"):
+        missing.append("PGPASSWORD or LAKEBASE_ENDPOINT")
+    if not get_env("DATABRICKS_SQL_HTTP_PATH"):
+        missing.append("DATABRICKS_SQL_HTTP_PATH")
+    return missing
 
 
-def render_route_cards() -> None:
-    """Show the three agent routes as first-class UI signals."""
+def render_header(settings, missing: list[str]) -> None:
+    """Render the top command bar."""
 
-    st.markdown(
-        """
-        <div class="pp-route-grid">
-          <div class="pp-route-card" style="--route-color:#ff4f5e;">
-            <div class="pp-route-label">RAG route</div>
-            <div class="pp-route-value">Evidence answers</div>
-            <div class="pp-route-copy">Reviews, tickets, manuals, SOPs, policies, citations.</div>
-          </div>
-          <div class="pp-route-card" style="--route-color:#2d60b7;">
-            <div class="pp-route-label">SQL route</div>
-            <div class="pp-route-value">Metric answers</div>
-            <div class="pp-route-copy">Gold Delta aggregates through the SQL Warehouse.</div>
-          </div>
-          <div class="pp-route-card" style="--route-color:#159a74;">
-            <div class="pp-route-label">Memory route</div>
-            <div class="pp-route-value">Context carryover</div>
-            <div class="pp-route-copy">Compact turn memory and durable user preferences.</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_runtime_panel(settings) -> None:
-    """Show compact runtime values for debugging deployment issues."""
-
-    rows = {
-        "Catalog": settings.catalog,
-        "Embedding": settings.embedding_model,
-        "LLM": settings.llm_endpoint,
-        "Retrieval": f"top_k={settings.top_k}, rerank_k={settings.rerank_k}",
-        "Lakebase user": get_env("PGUSER") or "not injected",
-    }
-
-    html_rows = "\n".join(
-        f"""
-            <tr>
-                <td>
-                    {escape(label)}
-                </td>
-                <td>
-                    {escape(str(value))}
-                </td>
-            </tr>
-        """
-        for label,value in rows.items()
-    )
+    config_state = "Ready" if not missing else "Needs config"
+    config_class = "pp-pill-ok" if not missing else "pp-pill-warn"
+    sql_state = "SQL ready" if get_env("DATABRICKS_SQL_HTTP_PATH") else "SQL path missing"
+    sql_class = "pp-pill-ok" if get_env("DATABRICKS_SQL_HTTP_PATH") else "pp-pill-warn"
+    lakebase_state = "Lakebase attached" if get_env("PGHOST") else "Lakebase pending"
+    lakebase_class = "pp-pill-ok" if get_env("PGHOST") else "pp-pill-warn"
+    catalog_label = escape(f"{settings.catalog}")
 
     st.markdown(
         f"""
-            <div class="pp-panel">
-                <div class="pp-panel-title">Runtime</div>
-                <table class="pp-runtime">{html_rows}</table>
+            <div class="pp-command">
+                <div class="pp-command-strip"></div>
+                <div class="pp-command-inner">
+                    <div class="pp-brand">
+                    <div class="pp-logo">PP</div>
+                    <div>
+                        <h1 class="pp-title">ProductPulse AI</h1>
+                        <div class="pp-subtitle">Retail intelligence cockpit for product, support, returns, and quality teams</div>
+                    </div>
+                    </div>
+                    <div class="pp-status-row">
+                    <span class="pp-pill {config_class}">{config_state}</span>
+                    <span class="pp-pill {lakebase_class}">{lakebase_state}</span>
+                    <span class="pp-pill {sql_class}">{sql_state}</span>
+                    <span class="pp-pill">{catalog_label}</span>
+                    </div>
+                </div>
             </div>
         """,
         unsafe_allow_html=True
-    )
-
-
-def render_health_panel(missing: list[str]) -> None:
-    """Show setup health without dumping stack traces into the main area."""
-    if missing:
-        status = "Configuration needed"
-        detail = escape(", ".join(missing))
-        css_class = "pp-pill-warn"
-    else:
-        status = "Ready"
-        detail = "RAG, memory, and metric routing are configured"
-        css_class = "pp-pill-ok" 
-
-    st.markdown(
-        f"""
-            <div class="pp-panel">
-                <div class="pp-panel-title">Status</div>
-                <div class="pp-kpi-grid">
-                    <div class="pp-kpi">
-                        <div class="pp-kpi-label">App</div>
-                        <div class="pp-kpi-value"><span class="pp-pill {css_class}">{status}</span></div>
-                    </div>
-                    <div class="pp-kpi">
-                        <div class="pp-kpi-label">Mode</div>
-                        <div class="pp-kpi-value">RAG + SQL + Memory</div>
-                    </div>
-                </div>
-                <div style="margin-top:0.75rem;color:#667085;font-size:0.82rem;overflow-wrap:anywhere;">{detail}</div>
-            </div>
-        """
     )
 
 
@@ -745,203 +631,303 @@ def render_starter_questions() -> None:
                     st.session_state.pending_question = starter
 
 
-def render_header(settings, missing: list[str]) -> None:
-    """Render the top command bar."""
-
-    config_state = "Ready" if not missing else "Needs config"
-    config_class = "pp-pill-ok" if not missing else "pp-pill-warn"
-    sql_state = "SQL ready" if get_env("DATABRICKS_SQL_HTTP_PATH") else "SQL path missing"
-    sql_class = "pp-pill-ok" if get_env("DATABRICKS_SQL_HTTP_PATH") else "pp-pill-warn"
-    lakebase_state = "Lakebase attached" if get_env("PGHOST") else "Lakebase pending"
-    lakebase_class = "pp-pill-ok" if get_env("PGHOST") else "pp-pill-warn"
-    catalog_label = escape(f"{settings.catalog}.{settings.schema}")
+def render_health_panel(missing: list[str]) -> None:
+    """Show setup health without dumping stack traces into the main area."""
+    if missing:
+        status = "Configuration needed"
+        detail = escape(", ".join(missing))
+        css_class = "pp-pill-warn"
+    else:
+        status = "Ready"
+        detail = "RAG, memory, and metric routing are configured"
+        css_class = "pp-pill-ok"
 
     st.markdown(
         f"""
-            <div class="pp-command">
-                <div class="pp-command-strip"></div>
-                <div class="pp-command-inner">
-                    <div class="pp-brand">
-                    <div class="pp-logo">PP</div>
-                    <div>
-                        <h1 class="pp-title">ProductPulse AI</h1>
-                        <div class="pp-subtitle">Retail intelligence cockpit for product, support, returns, and quality teams</div>
-                    </div>
-                    </div>
-                    <div class="pp-status-row">
-                    <span class="pp-pill {config_class}">{config_state}</span>
-                    <span class="pp-pill {lakebase_class}">{lakebase_state}</span>
-                    <span class="pp-pill {sql_class}">{sql_state}</span>
-                    <span class="pp-pill">{catalog_label}</span>
-                    </div>
+        <div class="pp-panel">
+            <div class="pp-panel-title">Status</div>
+            <div class="pp-kpi-grid">
+                <div class="pp-kpi">
+                    <div class="pp-kpi-label">App</div>
+                    <div class="pp-kpi-value"><span class="pp-pill {css_class}">{status}</span></div>
+                </div>
+                <div class="pp-kpi">
+                    <div class="pp-kpi-label">Mode</div>
+                    <div class="pp-kpi-value">RAG + SQL + Memory</div>
                 </div>
             </div>
+            <div style="margin-top:0.75rem;color:#667085;font-size:0.82rem;overflow-wrap:anywhere;">{detail}</div>
+        </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
-def missing_config() -> list[str]:
-    """List configuration values required before the app can answer questions.
+def render_runtime_panel(settings) -> None:
+    """Show compact runtime values for debugging deployment issues."""
 
-    Lakebase values are needed for both vector retrieval and memory. The SQL
-    Warehouse HTTP path is needed only for metric questions, but showing it here
-    makes setup issues visible immediately in the UI.
-    """
-    required = ["PGHOST", "PGDATABASE", "PGUSER"]
-    missing = [name for name in required if not get_env(name)]
-    if not get_env("PGPASSWORD") and not get_env("LAKEBASE_ENDPOINT"):
-        missing.append("PGPASSWORD or LAKEBASE_ENDPOINT")
-    if not get_env("DATABRICKS_SQL_HTTP_PATH"):
-        missing.append("DATABRICKS_SQL_HTTP_PATH")
-    return missing
+    rows = {
+        "Catalog": settings.catalog,
+        "Embedding": settings.embedding_model,
+        "LLM": settings.llm_endpoint,
+        "Retrieval": f"top_k={settings.top_k}, rerank_k={settings.rerank_k}",
+        "Lakebase user": get_env("PGUSER") or "not injected",
+    }
 
-
-@st.cache_resource(show_spinner=False)
-def ensure_lakebase_ready() -> bool:
-    """Verify Lakebase connectivity without requiring schema DDL permissions.
-
-    The daily pipeline owns schema creation and data loading. The app should be
-    least-privilege: it needs to read `rag_chunks` and read/write
-    `conversation_memory`, but it does not need permission to create extensions
-    or tables in the `public` schema.
-    """
-
-    with connect() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT 1;")
-            cur.fetchone()
-        finally:
-            cur.close()
-    return True
+    html_rows = "\n".join(
+        f"<tr><td>{escape(label)}</td><td>{escape(str(value))}</td></tr>"
+        for label, value in rows.items()
+    )
+    st.markdown(
+        f"""
+        <div class="pp-panel">
+          <div class="pp-panel-title">Runtime</div>
+          <table class="pp-runtime">{html_rows}</table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def main() -> None:
-    if "session_id" not in st.session_state:
-        # A session id keeps memory scoped to one browser conversation. Without it,
-        # multiple users could accidentally share memory rows.
-        st.session_state.session_id = f"streamlit-{uuid.uuid4()}"
+def render_route_cards() -> None:
+    """Show the three agent routes as first-class UI signals."""
 
-    if "messages" not in st.session_state:
-        # Streamlit reruns the script on every interaction. session_state preserves
-        # chat history across those reruns.
-        st.session_state.messages = []
+    st.markdown(
+        """
+        <div class="pp-route-grid">
+          <div class="pp-route-card" style="--route-color:#ff4f5e;">
+            <div class="pp-route-label">RAG route</div>
+            <div class="pp-route-value">Evidence answers</div>
+            <div class="pp-route-copy">Reviews, tickets, manuals, SOPs, policies, citations.</div>
+          </div>
+          <div class="pp-route-card" style="--route-color:#2d60b7;">
+            <div class="pp-route-label">SQL route</div>
+            <div class="pp-route-value">Metric answers</div>
+            <div class="pp-route-copy">Gold Delta aggregates through the SQL Warehouse.</div>
+          </div>
+          <div class="pp-route-card" style="--route-color:#159a74;">
+            <div class="pp-route-label">Memory route</div>
+            <div class="pp-route-value">Context carryover</div>
+            <div class="pp-route-copy">Compact turn memory and durable user preferences.</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    
+def render_dataset_strip() -> None:
+    """Render compact dataset signals for the empty/start state."""
+
+    st.markdown(
+        """
+        <div class="pp-mini-grid">
+          <div class="pp-mini">
+            <div class="pp-mini-num">2,331</div>
+            <div class="pp-mini-label">customer reviews</div>
+          </div>
+          <div class="pp-mini">
+            <div class="pp-mini-num">720</div>
+            <div class="pp-mini-label">support tickets</div>
+          </div>
+          <div class="pp-mini">
+            <div class="pp-mini-num">925</div>
+            <div class="pp-mini-label">return events</div>
+          </div>
+          <div class="pp-mini">
+            <div class="pp-mini-num">100</div>
+            <div class="pp-mini-label">PDF pages indexed</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-    settings = load_settings()
-    missing = missing_config()
-    inject_styles()
-    render_header(settings, missing)
-
-    # Main screen layout:
-    # - left column: analyst workspace, route cards, prompt form, chat transcript
-    # - right column: prompt library, health, runtime values, reset action
-    left, right = st.columns([0.72, 0.28], gap="large")
-
-    with right:
-        with st.container(border=True):
-            render_starter_questions()
-        render_health_panel(missing)
-        render_runtime_panel(settings)
-        st.markdown(
-            """
-                <div class="pp-side-note">
-                    SQL-only aggregate questions should show <strong>Lakebase used = false</strong>.
-                    RAG questions should show retrieved evidence and citations.
-                </div>
-            """,
-            unsafe_allow_html=True,
+def render_prompt_form() -> str | None:
+    """Render the primary prompt form and return submitted text."""
+    st.markdown(
+        """
+        <div class="pp-section-head">
+          <div>
+            <div class="pp-section-title">Ask ProductPulse</div>
+            <div class="pp-section-subtitle">Questions are routed to RAG, SQL metrics, memory, or a combined agent turn.</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.form("ask-productpulse", clear_on_submit=True):
+        prompt = st.text_input(
+            "Question",
+            label_visibility="collapsed",
+            placeholder="Ask about returns, product issues, ticket counts, sentiment, support guidance, or memory..."
         )
-        if st.button("Start new chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.session_id = f"streamlit-{uuid.uuid4()}"
-            st.rerun()
+        submitted = st.form_submit_button("Run analysis", use_container_width=True)
+    return prompt.strip() if submitted and prompt.strip() else None
 
-    with left:
-        with st.container(border=True):
-            # Route cards teach the three possible agent paths before the user asks
-            # anything. This makes the app useful as a bootcamp demonstration tool.
-            render_route_cards()
-            render_dataset_strip()
-            submitted_prompt = render_prompt_form()
 
-        if submitted_prompt:
-            st.session_state.pending_question = submitted_prompt
-        if not st.session_state.messages:
-            render_empty_state()
+def render_empty_state() -> None:
+    """Render a clean first-run state above the chat input."""
 
-        for message in st.session_state.messages:
-            # Re-render previous turns after every Streamlit rerun. Without this,
-            # clicking any button would clear the visible chat transcript.
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+    st.markdown(
+        """
+        <div class="pp-empty-state">
+          <div class="pp-empty-title">Conversation is ready.</div>
+          <div>Start with a RAG investigation, a SQL metric ranking, or a memory check from the prompt cards.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        prompt = None
-        if "pending_question" in st.session_state:
-            # Starter questions are stored briefly in session_state because
-            # Streamlit buttons and forms use the same downstream prompt path.
-            prompt = st.session_state.pop("pending_question")
 
-        if prompt:
-            # Store and render the user turn first so the UI feels like a normal
-            # chat app while the agent work is running.
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            )
-            with st.chat_message("user"):
-                st.markdown(prompt)
+def render_trace(result: dict[str, object]) -> None:
+    """Show the agent trace in compact tabs.
 
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking through product evidence and metrics..."):
-                    try:
-                        # Ask the LLM planner once in the app. We need the plan
-                        # before opening Lakebase so SQL-only turns can skip
-                        # Lakebase completely. The same plan is passed into
-                        # answer_question() to avoid a second planner call.
-                        turn_plan = plan_tools(prompt)
-                        needs_lakebase = (
-                            turn_plan["read_memory"]
-                            or turn_plan["rag_search"]
-                            or turn_plan["write_memory"]
-                        )
-                        if needs_lakebase:
-                            # Normal RAG/hybrid turns use one Lakebase connection
-                            # for memory read, vector search, and memory writes.
-                            with connect() as conn:
-                                result = answer_question(
-                                    conn=conn,
-                                    session_id=st.session_state.session_id,
-                                    question=prompt,
-                                    tool_plan=turn_plan
-                                )
-                        else:
-                            # SQL-only turns intentionally avoid Lakebase. This is
-                            # important for demonstrating the pure SQL Warehouse
-                            # path and for validating `Lakebase used = false`.
+    This trace is intentionally visible in the demo app. It lets learners
+    verify whether a question used SQL-only routing, RAG retrieval, memory, or
+    a hybrid path without reading logs.
+    """
+    with st.expander("Agent trace", expanded=False):
+        overview, metrics_tab, memory_tab, evidence_tab = st.tabs(
+            ["Route", 'Metrics', "Memory", "Evidence"]
+        )
+
+        with overview:
+            st.write("Execution mode", result.get("execution_mode"))
+            st.write("Lakebase used", result.get("lakebase_used"))
+            st.write("Tool plan", result["tool_plan"])
+            st.write("Rewritten query", result["rewritten_query"])
+        with metrics_tab:
+            st.write(result["metrics"])
+        with memory_tab:
+            st.write("Memory write result", result.get("memory_write_result"))
+            st.write("Memory seen", result.get("memory_seen"))
+            if result.get("memory_warnings"):
+                st.write("Memory warnings", result["memory_warnings"])
+        with evidence_tab:
+            st.write(result["evidence"])
+
+
+if "session_id" not in st.session_state:
+    # A session id keeps memory scoped to one browser conversation. Without it,
+    # multiple users could accidentally share memory rows.
+    st.session_state.session_id = f"streamlit-{uuid.uuid4()}"
+
+if "messages" not in st.session_state:
+    # Streamlit reruns the script on every interaction. session_state preserves
+    # chat history across those reruns.
+    st.session_state.messages = []
+
+settings = load_settings()
+missing = missing_config()
+inject_styles()
+render_header(settings, missing)
+
+# Main screen layout:
+# - left column: analyst workspace, route cards, prompt form, chat transcript
+# - right column: prompt library, health, runtime values, reset action
+left, right = st.columns([0.72, 0.28], gap="large")
+
+with right:
+    with st.container(border=True):
+        render_starter_questions()
+    render_health_panel(missing)
+    render_runtime_panel(settings)
+    st.markdown(
+        """
+        <div class="pp-side-note">
+            SQL-only aggregate questions should show <strong>Lakebase used = false</strong>.
+            RAG questions should show retrieved evidence and citations.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("Start new chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.session_id = f"streamlit-{uuid.uuid4()}"
+        st.rerun()
+
+with left:
+    with st.container(border=True):
+        # Route cards teach the three possible agent paths before the user asks
+        # anything. This makes the app useful as a bootcamp demonstration tool.
+        render_route_cards()
+        render_dataset_strip()
+        submitted_prompt = render_prompt_form()
+
+    if submitted_prompt:
+        st.session_state.pending_question = submitted_prompt
+    if not st.session_state.messages:
+        render_empty_state()
+
+    for message in st.session_state.messages:
+        # Re-render previous turns after every Streamlit rerun. Without this,
+        # clicking any button would clear the visible chat transcript.
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    prompt = None
+    if "pending_question" in st.session_state:
+        # Starter questions are stored briefly in session_state because
+        # Streamlit buttons and forms use the same downstream prompt path.
+        prompt = st.session_state.pop("pending_question")
+
+    if prompt:
+        # Store and render the user turn first so the UI feels like a normal
+        # chat app while the agent work is running.
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": prompt
+            }
+        )
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking through product evidence and metrics..."):
+                try:
+                    # Ask the LLM planner once in the app. We need the plan
+                    # before opening Lakebase so SQL-only turns can skip
+                    # Lakebase completely. The same plan is passed into
+                    # answer_question() to avoid a second planner call.
+                    turn_plan = plan_tools(prompt)
+                    needs_lakebase = (
+                        turn_plan["read_memory"]
+                        or turn_plan["rag_search"]
+                        or turn_plan["write_memory"]
+                    )
+                    if needs_lakebase:
+                        # Normal RAG/hybrid turns use one Lakebase connection
+                        # for memory read, vector search, and memory writes.
+                        with connect() as conn:
                             result = answer_question(
                                 conn=conn,
                                 session_id=st.session_state.session_id,
                                 question=prompt,
                                 tool_plan=turn_plan
                             )
-                        st.markdown(result["answer"])
-
-                        render_trace(result)
-
-                        st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "content": result["answer"]
-                            }
+                    else:
+                        # SQL-only turns intentionally avoid Lakebase. This is
+                        # important for demonstrating the pure SQL Warehouse
+                        # path and for validating `Lakebase used = false`.
+                        result = answer_question(
+                            conn=None,
+                            session_id=st.session_state.session_id,
+                            question=prompt,
+                            tool_plan=turn_plan
                         )
-                    except Exception as exc:
-                        error = f"Unable to complete the agent turn: {exc}"
-                        st.error(error)
-                        st.session_state.messages.append({"role": "assistant", "content": error})
+                    st.markdown(result["answer"])
+                    render_trace(result)
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": result["answer"]
+                        }
+                    )
+                except Exception as exc:
+                    error = f"Unable to complete the agent turn: {exc}"
+                    st.error(error)
+                    st.session_state.messages.append({"role": "assistant", "content": error})
 
-if __name__ == "__main__":
-    main()
